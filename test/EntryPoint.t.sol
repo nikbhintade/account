@@ -235,7 +235,7 @@ contract EntryPointTest is SoladyTest {
         vm.signAndAttachDelegation(delegation, alice);
         vm.deal(aliceAddress, 10 ether);
 
-        _activateRIPPRECOMPILE(true);
+        // _activateRIPPRECOMPILE(true);
 
         (uint256 x, uint256 y) = vm.publicKeyP256(alice);
 
@@ -312,7 +312,7 @@ contract EntryPointTest is SoladyTest {
         vm.signAndAttachDelegation(delegation, alice);
         vm.deal(aliceAddress, 10 ether);
 
-        _activateRIPPRECOMPILE(true);
+        // _activateRIPPRECOMPILE(true);
 
         (uint256 x, uint256 y) = vm.publicKeyP256(alice);
 
@@ -381,7 +381,7 @@ contract EntryPointTest is SoladyTest {
         vm.signAndAttachDelegation(delegation, alice);
         vm.deal(aliceAddress, 10 ether);
 
-        _activateRIPPRECOMPILE(true);
+        // _activateRIPPRECOMPILE(true);
 
         Delegation.Key memory key = Delegation.Key({
             expiry: 0,
@@ -543,7 +543,7 @@ contract EntryPointTest is SoladyTest {
 
         BLS.G2Point memory signature = BLS.msm(g2pts, scalars);
 
-        userOp.signature = abi.encodePacked(abi.encode(signature), keyHash, uint8(0));
+        userOp.signature = abi.encodePacked(abi.encode(signature, g2pts[0]), keyHash, uint8(0));
     }
 
     function testExecuteRevertWhenRunOutOfGas() public {
