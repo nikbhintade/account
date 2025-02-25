@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.23;
 
+import {console2 as console} from "forge-std/console2.sol";
+
 import {LibBit} from "solady/utils/LibBit.sol";
 import {LibBitmap} from "solady/utils/LibBitmap.sol";
 import {LibBytes} from "solady/utils/LibBytes.sol";
@@ -9,6 +11,7 @@ import {EIP712} from "solady/utils/EIP712.sol";
 import {ECDSA} from "solady/utils/ECDSA.sol";
 import {SignatureCheckerLib} from "solady/utils/SignatureCheckerLib.sol";
 import {P256} from "solady/utils/P256.sol";
+import {BLS} from "solady/utils/ext/ithaca/BLS.sol";
 import {WebAuthn} from "solady/utils/WebAuthn.sol";
 import {LibStorage} from "solady/utils/LibStorage.sol";
 import {EnumerableSetLib} from "solady/utils/EnumerableSetLib.sol";
@@ -33,7 +36,8 @@ contract Delegation is EIP712, GuardedExecutor {
     enum KeyType {
         P256,
         WebAuthnP256,
-        Secp256k1
+        Secp256k1,
+        BLS
     }
 
     /// @dev A key that can be used to authorize call.
@@ -422,6 +426,14 @@ contract Delegation is EIP712, GuardedExecutor {
         if (!$.keyHashes.remove(keyHash)) revert KeyDoesNotExist();
     }
 
+    function NEGATED_G1_GENERATOR() internal pure returns (BLS.G1Point memory) {
+        return BLS.G1Point(
+            bytes32(uint256(31827880280837800241567138048534752271)),
+            bytes32(uint256(88385725958748408079899006800036250932223001591707578097800747617502997169851)),
+            bytes32(uint256(22997279242622214937712647648895181298)),
+            bytes32(uint256(46816884707101390882112958134453447585552332943769894357249934112654335001290))
+        );
+    }
     ////////////////////////////////////////////////////////////////////////
     // Entry Point Functions
     ////////////////////////////////////////////////////////////////////////
@@ -501,6 +513,17 @@ contract Delegation is EIP712, GuardedExecutor {
             isValid = SignatureCheckerLib.isValidSignatureNowCalldata(
                 abi.decode(key.publicKey, (address)), digest, signature
             );
+        } else if (key.keyType == KeyType.BLS) {
+            BLS.G1Point[] memory g1pts = new BLS.G1Point[](2);
+            BLS.G2Point[] memory g2pts = new BLS.G2Point[](2);
+
+            g1pts[0] = NEGATED_G1_GENERATOR();
+            g1pts[1] = abi.decode(key.publicKey, (BLS.G1Point));
+
+            g2pts[0] = abi.decode(signature, (BLS.G2Point));
+            g2pts[1] = BLS.hashToG2(abi.encodePacked(digest));
+
+            isValid = BLS.pairing(g1pts, g2pts);
         }
     }
 
