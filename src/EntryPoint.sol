@@ -105,6 +105,17 @@ contract EntryPoint is EIP712, Ownable, CallContextChecker, ReentrancyGuardTrans
     /// @dev For returning the gas used and the error from a simulation.
     error SimulationResult(uint256 gUsed, bytes4 err);
 
+    /// @dev For returning the gas required and the error from a simulation.
+    /// `gExecute` is the recommended amount of gas to pass into execute.
+    /// `gCombined` is the recommendation for `gasCombined`.
+    /// `gUsed` is the amount of gas that has been eaten.
+    /// If the `err` is non-zero, it means that the simulation with `gExecute`
+    /// has not resulted in a success execution.
+    error SimulationResult2(uint256 gExecute, uint256 gCombined, uint256 gUsed, bytes4 err);
+
+    /// @dev The simulate execute 2 run has failed. Try passing in more gas to the simulation.
+    error SimulateExecute2Failed();
+
     /// @dev No revert has been encountered.
     error NoRevertEncoutered();
 
@@ -156,6 +167,9 @@ contract EntryPoint is EIP712, Ownable, CallContextChecker, ReentrancyGuardTrans
     /// @dev The amount of expected gas for refunds.
     uint256 internal constant _REFUND_GAS = 50000;
 
+    /// @dev The storage slot to determine if the simulation should check the amount of gas left.
+    uint256 internal constant _COMBINED_GAS_OVERRIDE_SLOT = 0xadfa658cdd8b2da0a825;
+
     ////////////////////////////////////////////////////////////////////////
     // Storage
     ////////////////////////////////////////////////////////////////////////
@@ -200,7 +214,7 @@ contract EntryPoint is EIP712, Ownable, CallContextChecker, ReentrancyGuardTrans
         nonReentrant
         returns (bytes4 err)
     {
-        (, err) = _execute(encodedUserOp);
+        (, err) = _execute(encodedUserOp, 0);
     }
 
     /// @dev Executes the array of encoded user operations.
@@ -219,24 +233,79 @@ contract EntryPoint is EIP712, Ownable, CallContextChecker, ReentrancyGuardTrans
             // We reluctantly use regular Solidity to access `encodedUserOps[i]`.
             // This generates an unnecessary check for `i < encodedUserOps.length`, but helps
             // generate all the implicit calldata bound checks on `encodedUserOps[i]`.
-            (, errs[i]) = _execute(encodedUserOps[i]);
+            (, errs[i]) = _execute(encodedUserOps[i], 0);
         }
     }
 
-    /// @dev This function does not actually execute. It simulates an execution
-    /// and reverts with the amount of gas used, and the error selector.
-    function simulateExecute(bytes calldata encodedUserOp) public payable virtual nonReentrant {
-        (uint256 gUsed, bytes4 err) = _execute(encodedUserOp);
+    /// @dev This function does not actually execute.
+    /// It simulates an execution and reverts with `SimulationResult2(gExecute, gCombined, gUsed, err)`.
+    function simulateExecute2(bytes calldata encodedUserOp) public payable virtual {
+        bytes memory data = abi.encodeCall(this.simulateExecute, encodedUserOp);
+        uint256 gExecute = gasleft();
+        uint256 gCombined;
+        uint256 gUsed;
+        bytes4 err;
+        assembly ("memory-safe") {
+            function callSimulateExecute(g_, data_) -> _success {
+                calldatacopy(0x00, calldatasize(), 0x40) // Zeroize the memory for the return data.
+                pop(call(g_, address(), 0, add(data_, 0x20), mload(data_), 0x00, 0x40))
+                _success := eq(shr(224, mload(0x00)), 0xb6013686) // `SimulationResult(uint256,bytes4)`.
+            }
+            function revertSimulateExecute2Failed() {
+                mstore(0x00, 0x0fdb7b86) // `SimulateExecute2Failed()`.
+                revert(0x1c, 0x04)
+            }
+
+            if iszero(callSimulateExecute(gas(), data)) { revertSimulateExecute2Failed() }
+            gUsed := mload(0x04)
+            err := mload(0x24)
+            // If the UserOp results in a successful execution, let's try to determine
+            // the amount of gas that needs to be passed in.
+            if iszero(err) {
+                // Tell `simulateExecute` that we just want the verification gas.
+                sstore(_COMBINED_GAS_OVERRIDE_SLOT, not(0))
+                // We need to use a reverting simulation call to measure the verification gas,
+                // as it resets warm address and storage access.
+                if iszero(callSimulateExecute(gas(), data)) { revertSimulateExecute2Failed() }
+
+                // Heuristic: if the verification gas is > 60k, assume it is P256 verification
+                // without the precompile, which has quite a large variance in verification gas.
+                // Add 100k (emprically determined) to the `gUsed` to account for the variance.
+                for { gCombined := add(gUsed, mul(100000, gt(mload(0x04), 60000))) } 1 {} {
+                    gCombined := add(gCombined, shr(4, gCombined)) // Heuristic: multiply by 1.0625.
+                    sstore(_COMBINED_GAS_OVERRIDE_SLOT, gCombined)
+                    if iszero(callSimulateExecute(gas(), data)) { revertSimulateExecute2Failed() }
+                    if iszero(mload(0x24)) { break }
+                }
+                // Tell `_execute` to early return, as we just want to test the 63/64 rule.
+                sstore(_COMBINED_GAS_OVERRIDE_SLOT, or(shl(96, address()), gCombined))
+                for { gExecute := gCombined } 1 {} {
+                    gExecute := add(gExecute, shr(5, gExecute)) // Heuristic: multiply by 1.03125.
+                    if callSimulateExecute(gExecute, data) { if iszero(mload(0x24)) { break } }
+                }
+                // Add a bit of buffer to account for the variations in
+                // function dispatch between `execute` and `simulateExecute`.
+                gExecute := add(gExecute, 500)
+            }
+        }
+        revert SimulationResult2(gExecute, gCombined, gUsed, err);
+    }
+
+    /// @dev This function does not actually execute.
+    /// It simulates an execution and reverts with `SimulationResult(gUsed, err)`.
+    function simulateExecute(bytes calldata encodedUserOp) public payable virtual {
+        uint256 g = LibStorage.ref(_COMBINED_GAS_OVERRIDE_SLOT).value;
+        if (g == type(uint256).max) {
+            uint256 gVerifyStart = gasleft();
+            _verify(_extractUserOp(encodedUserOp));
+            revert SimulationResult(Math.rawSub(gVerifyStart, gasleft()), 0);
+        }
+        (uint256 gUsed, bytes4 err) = _execute(encodedUserOp, g);
         revert SimulationResult(gUsed, err);
     }
 
     /// @dev This function is provided for debugging purposes.
-    function simulateFailedVerifyAndCall(bytes calldata encodedUserOp)
-        public
-        payable
-        virtual
-        nonReentrant
-    {
+    function simulateFailedVerifyAndCall(bytes calldata encodedUserOp) public payable virtual {
         UserOp calldata u = _extractUserOp(encodedUserOp);
         (bool isValid, bytes32 keyHash) = _verify(u);
         if (!isValid) revert VerificationError();
@@ -263,13 +332,13 @@ contract EntryPoint is EIP712, Ownable, CallContextChecker, ReentrancyGuardTrans
     }
 
     /// @dev Executes a single encoded UserOp.
-    function _execute(bytes calldata encodedUserOp)
+    function _execute(bytes calldata encodedUserOp, uint256 combinedGasOverride)
         internal
         virtual
         returns (uint256 gUsed, bytes4 err)
     {
         UserOp calldata u = _extractUserOp(encodedUserOp);
-        uint256 g = u.combinedGas;
+        uint256 g = Math.coalesce(uint96(combinedGasOverride), u.combinedGas);
         uint256 gStart = gasleft();
         uint256 paymentAmount;
 
@@ -280,6 +349,7 @@ contract EntryPoint is EIP712, Ownable, CallContextChecker, ReentrancyGuardTrans
             if (((gasleft() * 63) >> 6) < Math.saturatingAdd(g, _INNER_GAS_OVERHEAD)) {
                 revert InsufficientGas();
             }
+            if (combinedGasOverride >> 96 != 0) return (0, 0);
 
             // Verify and invalidate the nonce.
             // The nonce will be invalidated even if the UserOp fails.
@@ -525,12 +595,22 @@ contract EntryPoint is EIP712, Ownable, CallContextChecker, ReentrancyGuardTrans
         address eoa = u.eoa;
         assembly ("memory-safe") {
             if iszero(call(gas(), eoa, 0, add(0x20, data), mload(data), 0x00, 0x00)) {
+                let m := mload(0x40)
                 if iszero(bubbleRevert) {
+                    // If the reverted returndata fits within a single word.
+                    if iszero(gt(returndatasize(), 0x20)) {
+                        returndatacopy(m, 0x00, returndatasize())
+                        // And if it is not `bytes4(0)`, revert it with.
+                        if shr(224, mload(m)) { revert(m, returndatasize()) }
+                    }
+                    // Else, just revert with `CallError()
                     mstore(0x00, 0x6c9d47e8) // `CallError()`.
                     revert(0x1c, 0x04)
                 }
-                returndatacopy(mload(0x40), 0x00, returndatasize())
-                revert(mload(0x40), returndatasize())
+                // Otherwise, if `bubbleRevert` is true, bubble up the entire revert,
+                // this is for `simulateFailedVerifyAndCall`.
+                returndatacopy(m, 0x00, returndatasize())
+                revert(m, returndatasize())
             }
         }
     }

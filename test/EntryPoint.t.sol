@@ -3,16 +3,37 @@ pragma solidity ^0.8.4;
 
 import "./utils/SoladyTest.sol";
 import {LibClone} from "solady/utils/LibClone.sol";
+import {LibBytes} from "solady/utils/LibBytes.sol";
+import {GasBurnerLib} from "solady/utils/GasBurnerLib.sol";
+import {P256} from "solady/utils/P256.sol";
 import {LibSort} from "solady/utils/LibSort.sol";
 import {BLS} from "solady/utils/ext/ithaca/BLS.sol";
 import {Delegation} from "../src/Delegation.sol";
 import {EntryPoint, MockEntryPoint} from "./utils/mocks/MockEntryPoint.sol";
 import {ERC20, MockPaymentToken} from "./utils/mocks/MockPaymentToken.sol";
 
+contract GasBurner {
+    uint256 public randomness;
+
+    function setRandomness(uint256 r) public {
+        randomness = r;
+    }
+
+    function burnGas(uint256 x, uint256 r) public {
+        if (r & 1 == 0) {
+            GasBurnerLib.burnPure(x);
+        } else {
+            this.burnGas(x, r >> 1);
+        }
+        randomness = r;
+    }
+}
+
 contract EntryPointTest is SoladyTest {
     MockEntryPoint ep;
     MockPaymentToken paymentToken;
     address delegation;
+    GasBurner gasBurner;
 
     TargetFunctionPayload[] targetFunctionPayloads;
 
@@ -23,6 +44,7 @@ contract EntryPointTest is SoladyTest {
     }
 
     function setUp() public {
+        gasBurner = new GasBurner();
         Delegation tempDelegation = new Delegation();
         ep = MockEntryPoint(payable(tempDelegation.ENTRY_POINT()));
         MockEntryPoint tempMockEntryPoint = new MockEntryPoint();
@@ -132,6 +154,154 @@ contract EntryPointTest is SoladyTest {
 
         bytes4 err = ep.execute(abi.encode(userOp));
         assertEq(EntryPoint.PaymentError.selector, err);
+    }
+
+    struct _SimulateExecute2Temps {
+        uint256 gasToBurn;
+        uint256 randomness;
+        uint256 gExecute;
+        uint256 gCombined;
+        uint256 gUsed;
+        bytes executionData;
+        bool success;
+        bytes result;
+    }
+
+    function testSimulateExecute2WithEOAKey(bytes32) public {
+        (address randomSigner, uint256 privateKey) = _randomSigner();
+
+        // eip-7702 delegation
+        vm.signAndAttachDelegation(delegation, privateKey);
+
+        paymentToken.mint(randomSigner, 500 ether);
+
+        _SimulateExecute2Temps memory t;
+
+        gasBurner.setRandomness(1); // Warm the storage first.
+
+        t.gasToBurn = _bound(_random(), 0, 1000000);
+        do {
+            t.randomness = _randomUniform();
+        } while (t.randomness == 0);
+        emit LogUint("gasToBurn", t.gasToBurn);
+        t.executionData = _getExecutionData(
+            address(gasBurner),
+            0,
+            abi.encodeWithSignature("burnGas(uint256,uint256)", t.gasToBurn, t.randomness)
+        );
+
+        EntryPoint.UserOp memory userOp = EntryPoint.UserOp({
+            eoa: randomSigner,
+            nonce: 0,
+            executionData: t.executionData,
+            payer: address(0x00),
+            paymentToken: address(paymentToken),
+            paymentRecipient: address(0x00),
+            paymentAmount: 0.1 ether,
+            paymentMaxAmount: 0.5 ether,
+            paymentPerGas: 1e9,
+            combinedGas: 30000000,
+            signature: ""
+        });
+
+        _fillSecp256k1Signature(userOp, privateKey, 0);
+
+        (t.success, t.result) =
+            address(ep).call(abi.encodeWithSignature("simulateExecute2(bytes)", abi.encode(userOp)));
+
+        assertFalse(t.success);
+        assertEq(bytes4(LibBytes.load(t.result, 0x00)), EntryPoint.SimulationResult2.selector);
+
+        t.gExecute = uint256(LibBytes.load(t.result, 0x04));
+        t.gCombined = uint256(LibBytes.load(t.result, 0x24));
+        t.gUsed = uint256(LibBytes.load(t.result, 0x44));
+        emit LogUint(t.gExecute);
+        emit LogUint(t.gCombined);
+        emit LogUint(t.gUsed);
+        assertEq(bytes4(LibBytes.load(t.result, 0x64)), 0);
+
+        userOp.combinedGas = t.gCombined;
+        userOp.signature = "";
+        _fillSecp256k1Signature(userOp, privateKey, 0);
+
+        assertEq(ep.execute{gas: t.gExecute}(abi.encode(userOp)), 0);
+        assertEq(gasBurner.randomness(), t.randomness);
+    }
+
+    function testSimulateExecute2WithP256(bytes32) public {
+        uint256 alice = uint256(keccak256("alicePrivateKey"));
+        address payable aliceAddress = payable(vm.addr(alice));
+
+        vm.signAndAttachDelegation(delegation, alice);
+        vm.deal(aliceAddress, 10 ether);
+
+        _activateRIPPRECOMPILE(true);
+
+        (uint256 x, uint256 y) = vm.publicKeyP256(alice);
+
+        Delegation.Key memory key = Delegation.Key({
+            expiry: 0,
+            keyType: Delegation.KeyType.P256,
+            isSuperAdmin: true,
+            publicKey: abi.encode(x, y)
+        });
+
+        paymentToken.mint(aliceAddress, 50 ether);
+
+        vm.prank(aliceAddress);
+        bytes32 keyHash = Delegation(aliceAddress).authorize(key);
+
+        _SimulateExecute2Temps memory t;
+
+        gasBurner.setRandomness(1); // Warm the storage first.
+
+        t.gasToBurn = _bound(_random(), 0, 1000000);
+        do {
+            t.randomness = _randomUniform();
+        } while (t.randomness == 0);
+        emit LogUint("gasToBurn", t.gasToBurn);
+        t.executionData = _getExecutionData(
+            address(gasBurner),
+            0,
+            abi.encodeWithSignature("burnGas(uint256,uint256)", t.gasToBurn, t.randomness)
+        );
+
+        EntryPoint.UserOp memory userOp = EntryPoint.UserOp({
+            eoa: aliceAddress,
+            nonce: 0,
+            executionData: t.executionData,
+            payer: address(0x00),
+            paymentToken: address(paymentToken),
+            paymentRecipient: address(0x00),
+            paymentAmount: 0.1 ether,
+            paymentMaxAmount: 0.5 ether,
+            paymentPerGas: 1e9,
+            combinedGas: 30000000,
+            signature: ""
+        });
+
+        _fillSecp256r1Signature(userOp, alice, keyHash);
+
+        (t.success, t.result) =
+            address(ep).call(abi.encodeWithSignature("simulateExecute2(bytes)", abi.encode(userOp)));
+
+        assertFalse(t.success);
+        assertEq(bytes4(LibBytes.load(t.result, 0x00)), EntryPoint.SimulationResult2.selector);
+
+        t.gExecute = uint256(LibBytes.load(t.result, 0x04));
+        t.gCombined = uint256(LibBytes.load(t.result, 0x24));
+        t.gUsed = uint256(LibBytes.load(t.result, 0x44));
+        emit LogUint(t.gExecute);
+        emit LogUint(t.gCombined);
+        emit LogUint(t.gUsed);
+        assertEq(bytes4(LibBytes.load(t.result, 0x64)), 0);
+
+        userOp.combinedGas = t.gCombined;
+        userOp.signature = "";
+        _fillSecp256r1Signature(userOp, alice, keyHash);
+
+        assertEq(ep.execute{gas: t.gExecute}(abi.encode(userOp)), 0);
+        assertEq(gasBurner.randomness(), t.randomness);
     }
 
     function testExecuteWithP256Signature() public {
@@ -735,6 +905,10 @@ contract EntryPointTest is SoladyTest {
     ) internal view {
         bytes32 digest = ep.computeDigest(userOp);
         (bytes32 r, bytes32 s) = vm.signP256(privateKey, digest);
+        assembly ("memory-safe") {
+            let n := 0xFFFFFFFF00000000FFFFFFFFFFFFFFFFBCE6FAADA7179E84F3B9CAC2FC632551
+            if lt(shr(1, n), s) { s := sub(n, s) }
+        }
         userOp.signature = abi.encodePacked(abi.encode(r, s), keyHash, uint8(0));
     }
 
